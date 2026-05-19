@@ -466,8 +466,23 @@ class RewardsCfg:
         },
     )
 
-
-
+    periodic_gait = RewTerm(
+        func=mdp.periodic_bipedal_gait_reward,
+        weight=0.5,
+        params={
+            "period": 0.6,
+            "offset": [0.0, 0.5],
+            "stance_ratio": 0.5,
+            "phase_smoothing": 40.0,
+            "force_scale": 50.0,
+            "velocity_scale": 1.0,
+            "std": 0.5,
+            "command_name": "base_velocity",
+            "command_threshold": 0.05,
+            "asset_cfg": SceneEntityCfg("robot", body_names=".*ankle_roll.*"),
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*ankle_roll.*"),
+        },
+    )
 
     feet_slide = RewTerm(
         func=mdp.feet_slide,

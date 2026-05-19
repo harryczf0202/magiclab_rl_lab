@@ -201,6 +201,79 @@ def air_time_variance_penalty(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg
     )
 
 
+def _smooth_periodic_window(
+    phase: torch.Tensor,
+    start: float,
+    end: float,
+    sharpness: float,
+) -> torch.Tensor:
+    width = end - start
+    if width <= 0.0:
+        width += 1.0
+    if width >= 1.0:
+        return torch.ones_like(phase)
+
+    center = (start + 0.5 * width) % 1.0
+    phase_error = torch.atan2(
+        torch.sin(2.0 * torch.pi * (phase - center)),
+        torch.cos(2.0 * torch.pi * (phase - center)),
+    ) / (2.0 * torch.pi)
+    return torch.sigmoid(sharpness * (0.5 * width - torch.abs(phase_error)))
+
+
+def periodic_bipedal_gait_reward(
+    env: ManagerBasedRLEnv,
+    period: float,
+    offset: list[float],
+    asset_cfg: SceneEntityCfg,
+    sensor_cfg: SceneEntityCfg,
+    stance_ratio: float = 0.5,
+    phase_smoothing: float = 40.0,
+    force_scale: float = 50.0,
+    velocity_scale: float = 1.0,
+    std: float = 0.5,
+    force_weight: float = 1.0,
+    velocity_weight: float = 1.0,
+    command_name: str | None = "base_velocity",
+    command_threshold: float = 0.05,
+) -> torch.Tensor:
+    """Reward periodic gait composition from foot-force and foot-speed phases.
+
+    This implements the paper's bipedal periodic reward idea as a bounded reward:
+    swing phases penalize foot force, while stance phases penalize foot speed.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+
+    foot_force = torch.linalg.norm(contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, :], dim=-1)
+    foot_speed = torch.linalg.norm(asset.data.body_lin_vel_w[:, asset_cfg.body_ids, :], dim=-1)
+
+    offsets = torch.tensor(offset, dtype=torch.float, device=env.device)
+    if offsets.numel() != foot_force.shape[1]:
+        raise RuntimeError(
+            f"Expected {foot_force.shape[1]} gait offsets for periodic_bipedal_gait_reward, got {offsets.numel()}."
+        )
+
+    global_phase = (env.episode_length_buf * env.step_dt) % period / period
+    foot_phase = torch.remainder(global_phase.unsqueeze(1) + offsets.unsqueeze(0), 1.0)
+
+    stance_ratio = min(max(stance_ratio, 1.0e-3), 1.0 - 1.0e-3)
+    stance_prob = _smooth_periodic_window(foot_phase, 0.0, stance_ratio, phase_smoothing)
+    swing_prob = 1.0 - stance_prob
+
+    force_cost = swing_prob * torch.tanh(foot_force / force_scale)
+    velocity_cost = stance_prob * torch.tanh(foot_speed / velocity_scale)
+    gait_cost = torch.mean(force_weight * force_cost + velocity_weight * velocity_cost, dim=1)
+    reward = torch.exp(-gait_cost / std)
+
+    if command_name is not None:
+        cmd_norm = torch.norm(env.command_manager.get_command(command_name), dim=1)
+        reward *= cmd_norm > command_threshold
+
+    upright = torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
+    return reward * upright
+
+
 """
 Feet Gait rewards.
 """
