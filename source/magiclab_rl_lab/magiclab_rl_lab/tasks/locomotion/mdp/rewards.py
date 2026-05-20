@@ -201,12 +201,35 @@ def air_time_variance_penalty(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg
     )
 
 
-def _smooth_periodic_window(
+def pelvis_acceleration_l2(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """Penalize aggressive pelvis linear acceleration."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    root_vel = asset.data.root_lin_vel_w
+
+    if not hasattr(env, "_pelvis_prev_root_vel") or env._pelvis_prev_root_vel.shape != root_vel.shape:
+        env._pelvis_prev_root_vel = root_vel.clone()
+
+    acc = (root_vel - env._pelvis_prev_root_vel) / env.step_dt
+    env._pelvis_prev_root_vel = root_vel.clone()
+
+    reset_mask = env.episode_length_buf < 2
+    reward = torch.sum(torch.square(acc), dim=-1)
+    reward[reset_mask] = 0.0
+    return reward
+
+
+def _periodic_interval_expectation(
     phase: torch.Tensor,
     start: float,
     end: float,
-    sharpness: float,
+    kappa: float,
 ) -> torch.Tensor:
+    """Expected phase indicator for a circular interval.
+
+    The paper uses Von Mises-distributed start/end times. This deterministic
+    expectation keeps the same circular interval semantics and smooth boundary
+    uncertainty with a sigmoid concentration parameter.
+    """
     width = end - start
     if width <= 0.0:
         width += 1.0
@@ -218,7 +241,7 @@ def _smooth_periodic_window(
         torch.sin(2.0 * torch.pi * (phase - center)),
         torch.cos(2.0 * torch.pi * (phase - center)),
     ) / (2.0 * torch.pi)
-    return torch.sigmoid(sharpness * (0.5 * width - torch.abs(phase_error)))
+    return torch.sigmoid(kappa * (0.5 * width - torch.abs(phase_error)))
 
 
 def periodic_bipedal_gait_reward(
@@ -228,19 +251,20 @@ def periodic_bipedal_gait_reward(
     asset_cfg: SceneEntityCfg,
     sensor_cfg: SceneEntityCfg,
     stance_ratio: float = 0.5,
-    phase_smoothing: float = 40.0,
+    kappa: float = 40.0,
     force_scale: float = 50.0,
     velocity_scale: float = 1.0,
     std: float = 0.5,
     force_weight: float = 1.0,
     velocity_weight: float = 1.0,
+    beta: float = 0.0,
     command_name: str | None = "base_velocity",
     command_threshold: float = 0.05,
 ) -> torch.Tensor:
-    """Reward periodic gait composition from foot-force and foot-speed phases.
+    """Walking-only periodic reward composition from foot force and speed.
 
-    This implements the paper's bipedal periodic reward idea as a bounded reward:
-    swing phases penalize foot force, while stance phases penalize foot speed.
+    The force component is active in swing and the speed component is active
+    in stance, matching the paper's bipedal reward structure for walking.
     """
     asset: Articulation = env.scene[asset_cfg.name]
     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
@@ -258,13 +282,13 @@ def periodic_bipedal_gait_reward(
     foot_phase = torch.remainder(global_phase.unsqueeze(1) + offsets.unsqueeze(0), 1.0)
 
     stance_ratio = min(max(stance_ratio, 1.0e-3), 1.0 - 1.0e-3)
-    stance_prob = _smooth_periodic_window(foot_phase, 0.0, stance_ratio, phase_smoothing)
+    stance_prob = _periodic_interval_expectation(foot_phase, 0.0, stance_ratio, kappa)
     swing_prob = 1.0 - stance_prob
 
-    force_cost = swing_prob * torch.tanh(foot_force / force_scale)
-    velocity_cost = stance_prob * torch.tanh(foot_speed / velocity_scale)
-    gait_cost = torch.mean(force_weight * force_cost + velocity_weight * velocity_cost, dim=1)
-    reward = torch.exp(-gait_cost / std)
+    force_measure = torch.tanh(foot_force / force_scale)
+    speed_measure = torch.tanh(foot_speed / velocity_scale)
+    expected_reward = -force_weight * swing_prob * force_measure - velocity_weight * stance_prob * speed_measure
+    reward = beta + torch.exp(torch.mean(expected_reward, dim=1) / std)
 
     if command_name is not None:
         cmd_norm = torch.norm(env.command_manager.get_command(command_name), dim=1)
@@ -377,21 +401,55 @@ Other rewards.
 """
 
 
-def joint_mirror(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, mirror_joints: list[list[str]]) -> torch.Tensor:
-    # extract the used quantities (to enable type-hinting)
+def joint_mirror(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    mirror_joints: list[list[str]],
+    joint_weights: list[float] | None = None,
+    alpha: float = 0.05,
+    warmup_steps: int = 30,
+) -> torch.Tensor:
+    """Penalize left/right statistical asymmetry over a gait window."""
     asset: Articulation = env.scene[asset_cfg.name]
     if not hasattr(env, "joint_mirror_joints_cache") or env.joint_mirror_joints_cache is None:
-        # Cache joint positions for all pairs
         env.joint_mirror_joints_cache = [
             [asset.find_joints(joint_name) for joint_name in joint_pair] for joint_pair in mirror_joints
         ]
-    reward = torch.zeros(env.num_envs, device=env.device)
-    # Iterate over all joint pairs
-    for joint_pair in env.joint_mirror_joints_cache:
-        # Calculate the difference for each pair and add to the total reward
-        reward += torch.sum(
-            torch.square(asset.data.joint_pos[:, joint_pair[0][0]] - asset.data.joint_pos[:, joint_pair[1][0]]),
-            dim=-1,
+        n_pairs = len(mirror_joints)
+        if joint_weights is None:
+            joint_weights = [1.0] * n_pairs
+        weights = torch.tensor(joint_weights, device=env.device, dtype=torch.float)
+        env._joint_mirror_weights = weights / torch.clamp(torch.sum(weights), min=1.0e-6)
+        env._joint_mirror_mean_l = torch.zeros(env.num_envs, n_pairs, device=env.device)
+        env._joint_mirror_mean_r = torch.zeros(env.num_envs, n_pairs, device=env.device)
+        env._joint_mirror_var_l = torch.zeros(env.num_envs, n_pairs, device=env.device)
+        env._joint_mirror_var_r = torch.zeros(env.num_envs, n_pairs, device=env.device)
+        env._joint_mirror_count = torch.zeros(env.num_envs, 1, device=env.device)
+
+    reset_mask = (env.episode_length_buf < 2).unsqueeze(1)
+    env._joint_mirror_mean_l = torch.where(reset_mask, torch.zeros_like(env._joint_mirror_mean_l), env._joint_mirror_mean_l)
+    env._joint_mirror_mean_r = torch.where(reset_mask, torch.zeros_like(env._joint_mirror_mean_r), env._joint_mirror_mean_r)
+    env._joint_mirror_var_l = torch.where(reset_mask, torch.zeros_like(env._joint_mirror_var_l), env._joint_mirror_var_l)
+    env._joint_mirror_var_r = torch.where(reset_mask, torch.zeros_like(env._joint_mirror_var_r), env._joint_mirror_var_r)
+    env._joint_mirror_count = torch.where(reset_mask, torch.zeros_like(env._joint_mirror_count), env._joint_mirror_count)
+
+    env._joint_mirror_count += 1
+    for i, joint_pair in enumerate(env.joint_mirror_joints_cache):
+        pos_l = asset.data.joint_pos[:, joint_pair[0][0]].squeeze(-1)
+        pos_r = asset.data.joint_pos[:, joint_pair[1][0]].squeeze(-1)
+        env._joint_mirror_mean_l[:, i] = (1.0 - alpha) * env._joint_mirror_mean_l[:, i] + alpha * pos_l
+        env._joint_mirror_mean_r[:, i] = (1.0 - alpha) * env._joint_mirror_mean_r[:, i] + alpha * pos_r
+        env._joint_mirror_var_l[:, i] = (
+            (1.0 - alpha) * env._joint_mirror_var_l[:, i]
+            + alpha * torch.square(pos_l - env._joint_mirror_mean_l[:, i])
         )
-    reward *= 1 / len(mirror_joints) if len(mirror_joints) > 0 else 0
+        env._joint_mirror_var_r[:, i] = (
+            (1.0 - alpha) * env._joint_mirror_var_r[:, i]
+            + alpha * torch.square(pos_r - env._joint_mirror_mean_r[:, i])
+        )
+
+    mean_error = torch.square(env._joint_mirror_mean_l - env._joint_mirror_mean_r)
+    std_error = torch.square(torch.sqrt(env._joint_mirror_var_l + 1.0e-8) - torch.sqrt(env._joint_mirror_var_r + 1.0e-8))
+    reward = torch.sum((mean_error + std_error) * env._joint_mirror_weights.unsqueeze(0), dim=-1)
+    reward *= (env._joint_mirror_count.squeeze(-1) >= warmup_steps).float()
     return reward

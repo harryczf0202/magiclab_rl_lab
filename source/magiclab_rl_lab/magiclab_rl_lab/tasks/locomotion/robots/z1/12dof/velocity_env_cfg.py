@@ -94,8 +94,8 @@ class EventCfg:
         mode="startup",
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
-            "static_friction_range": (0.3, 1.0),
-            "dynamic_friction_range": (0.3, 1.0),
+            "static_friction_range": (0.35, 1.1),
+            "dynamic_friction_range": (0.35, 1.1),
             "restitution_range": (0.0, 0.0),
             "num_buckets": 64,
         },
@@ -106,7 +106,7 @@ class EventCfg:
         mode="startup",
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names="pelvis"),
-            "mass_distribution_params": (0.7, 1.3),
+            "mass_distribution_params": (0.5, 1.5),
             "operation": "scale",
             "recompute_inertia": True,
         },
@@ -117,7 +117,7 @@ class EventCfg:
         mode="startup",
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
-            "mass_distribution_params": (0.7, 1.3),
+            "mass_distribution_params": (0.5, 1.5),
             "operation": "scale",
             "recompute_inertia": True,
         },
@@ -261,7 +261,7 @@ class ObservationsCfg:
                                     "right_ankle_roll_joint",
                                 ], 
                                 preserve_order=True)},
-                                noise=Unoise(n_min=-0.02, n_max=0.02))
+                                noise=Unoise(n_min=-0.05, n_max=0.05))
         joint_vel_rel = ObsTerm(func=mdp.joint_vel_rel,
                                 params={"asset_cfg": SceneEntityCfg("robot", 
                                 joint_names=[
@@ -285,6 +285,15 @@ class ObservationsCfg:
                                 scale=1.0,
                               )
         gait_phase = ObsTerm(func=mdp.gait_phase, params={"period": 0.6})
+        walking_phase_clock = ObsTerm(
+            func=mdp.walking_phase_clock,
+            params={
+                "period": 0.6,
+                "offset": [0.0, 0.5],
+                "stance_ratio": 0.5,
+                "command_name": "base_velocity",
+            },
+        )
 
         def __post_init__(self):
             self.history_length = 5
@@ -345,6 +354,15 @@ class ObservationsCfg:
                               scale=1.0,
                               )
         gait_phase = ObsTerm(func=mdp.gait_phase, params={"period": 0.6})
+        walking_phase_clock = ObsTerm(
+            func=mdp.walking_phase_clock,
+            params={
+                "period": 0.6,
+                "offset": [0.0, 0.5],
+                "stance_ratio": 0.5,
+                "command_name": "base_velocity",
+            },
+        )
         # height_scanner = ObsTerm(func=mdp.height_scan,
         #     params={"sensor_cfg": SceneEntityCfg("height_scanner")},
         #     clip=(-1.0, 5.0),
@@ -382,6 +400,7 @@ class RewardsCfg:
     action_rate = RewTerm(func=mdp.action_rate_l2, weight=-0.05)
     dof_pos_limits = RewTerm(func=mdp.joint_pos_limits, weight=-5.0)
     energy = RewTerm(func=mdp.energy, weight=-2e-5)
+    pelvis_acceleration = RewTerm(func=mdp.pelvis_acceleration_l2, weight=-1e-5)
 
     # joint_deviation_arms = RewTerm(
     #     func=mdp.joint_deviation_l1,
@@ -413,6 +432,22 @@ class RewardsCfg:
         func=mdp.joint_deviation_l1,
         weight=-0.7,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_hip_roll_joint", ".*_hip_yaw_joint"])},
+    )
+    joint_mirror = RewTerm(
+        func=mdp.joint_mirror,
+        weight=-0.2,
+        params={
+            "asset_cfg": SceneEntityCfg("robot"),
+            "mirror_joints": [
+                ["left_hip_pitch_joint", "right_hip_pitch_joint"],
+                ["left_hip_roll_joint", "right_hip_roll_joint"],
+                ["left_hip_yaw_joint", "right_hip_yaw_joint"],
+                ["left_knee_joint", "right_knee_joint"],
+                ["left_ankle_pitch_joint", "right_ankle_pitch_joint"],
+                ["left_ankle_roll_joint", "right_ankle_roll_joint"],
+            ],
+            "joint_weights": [1.0, 1.0, 1.0, 1.5, 3.0, 1.0],
+        },
     )
 
     # joint_pos_penalty = RewTerm(
@@ -473,7 +508,7 @@ class RewardsCfg:
             "period": 0.6,
             "offset": [0.0, 0.5],
             "stance_ratio": 0.5,
-            "phase_smoothing": 40.0,
+            "kappa": 40.0,
             "force_scale": 50.0,
             "velocity_scale": 1.0,
             "std": 0.5,

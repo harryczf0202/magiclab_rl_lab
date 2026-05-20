@@ -55,6 +55,32 @@ def gait_phase(env: ManagerBasedRLEnv, period: float) -> torch.Tensor:
     return stance_mask
 
 
+def walking_phase_clock(
+    env: ManagerBasedRLEnv,
+    period: float,
+    offset: list[float],
+    stance_ratio: float,
+    command_name: str = "base_velocity",
+    command_threshold: float = 0.02,
+) -> torch.Tensor:
+    """Walking-only clock inputs and phase ratios for the periodic reward."""
+    if not hasattr(env, "episode_length_buf"):
+        env.episode_length_buf = torch.zeros(env.num_envs, device=env.device, dtype=torch.long)
+
+    offsets = torch.tensor(offset, dtype=torch.float, device=env.device)
+    global_phase = (env.episode_length_buf * env.step_dt) % period / period
+    foot_phase = torch.remainder(global_phase.unsqueeze(1) + offsets.unsqueeze(0), 1.0)
+
+    obs = torch.zeros(env.num_envs, offsets.numel() + 2, device=env.device)
+    obs[:, : offsets.numel()] = torch.sin(2.0 * torch.pi * foot_phase)
+    obs[:, -2] = stance_ratio
+    obs[:, -1] = 1.0 - stance_ratio
+
+    cmd_norm = torch.norm(env.command_manager.get_command(command_name), dim=1)
+    obs[cmd_norm < command_threshold, : offsets.numel()] = 0.0
+    return obs
+
+
 def contact_mask(
     env: ManagerBasedRLEnv,
     sensor_cfg: SceneEntityCfg,             
