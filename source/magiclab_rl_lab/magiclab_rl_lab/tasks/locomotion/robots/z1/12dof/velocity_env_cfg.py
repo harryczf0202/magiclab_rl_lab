@@ -285,15 +285,6 @@ class ObservationsCfg:
                                 scale=1.0,
                               )
         gait_phase = ObsTerm(func=mdp.gait_phase, params={"period": 0.6})
-        walking_phase_clock = ObsTerm(
-            func=mdp.walking_phase_clock,
-            params={
-                "period": 0.6,
-                "offset": [0.0, 0.5],
-                "stance_ratio": 0.5,
-                "command_name": "base_velocity",
-            },
-        )
 
         def __post_init__(self):
             self.history_length = 5
@@ -354,15 +345,6 @@ class ObservationsCfg:
                               scale=1.0,
                               )
         gait_phase = ObsTerm(func=mdp.gait_phase, params={"period": 0.6})
-        walking_phase_clock = ObsTerm(
-            func=mdp.walking_phase_clock,
-            params={
-                "period": 0.6,
-                "offset": [0.0, 0.5],
-                "stance_ratio": 0.5,
-                "command_name": "base_velocity",
-            },
-        )
         # height_scanner = ObsTerm(func=mdp.height_scan,
         #     params={"sensor_cfg": SceneEntityCfg("height_scanner")},
         #     clip=(-1.0, 5.0),
@@ -388,6 +370,23 @@ class RewardsCfg:
     )
     track_ang_vel_z = RewTerm(
         func=mdp.track_ang_vel_z_exp, weight=0.5, params={"command_name": "base_velocity", "std": math.sqrt(0.25)}
+    )
+
+    # -- straight-line walking (fixes diagonal drift)
+    lateral_vel_penalty = RewTerm(
+        func=mdp.lateral_velocity_penalty,
+        weight=-2.0,
+        params={"command_name": "base_velocity"},
+    )
+    heading_alignment = RewTerm(
+        func=mdp.heading_velocity_alignment,
+        weight=0.3,
+        params={"command_name": "base_velocity", "speed_threshold": 0.1},
+    )
+    yaw_rate_penalty = RewTerm(
+        func=mdp.base_yaw_rate_penalty,
+        weight=-1.0,
+        params={"command_name": "base_velocity"},
     )
 
     alive = RewTerm(func=mdp.is_alive, weight=0.15)
@@ -430,12 +429,12 @@ class RewardsCfg:
     # )
     joint_deviation_legs = RewTerm(
         func=mdp.joint_deviation_l1,
-        weight=-0.7,
+        weight=-1.0,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_hip_roll_joint", ".*_hip_yaw_joint"])},
     )
     joint_mirror = RewTerm(
         func=mdp.joint_mirror,
-        weight=-0.2,
+        weight=-0.4,
         params={
             "asset_cfg": SceneEntityCfg("robot"),
             "mirror_joints": [

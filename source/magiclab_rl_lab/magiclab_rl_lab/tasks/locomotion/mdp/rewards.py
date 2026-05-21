@@ -453,3 +453,82 @@ def joint_mirror(
     reward = torch.sum((mean_error + std_error) * env._joint_mirror_weights.unsqueeze(0), dim=-1)
     reward *= (env._joint_mirror_count.squeeze(-1) >= warmup_steps).float()
     return reward
+
+
+"""
+Straight-line walking rewards.
+
+These reward terms are designed to prevent diagonal drift and crab-walking
+in bipedal locomotion, following reward design principles from:
+- Berkeley Humanoid (2024): explicit lateral velocity penalty in body frame
+- Cassie / UC Berkeley: yaw-rate tracking and heading alignment
+"""
+
+
+def lateral_velocity_penalty(
+    env: ManagerBasedRLEnv,
+    command_name: str = "base_velocity",
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalise lateral (y-axis) velocity error in the yaw-aligned body frame.
+
+    Computes (v_y_body - v_y_cmd)^2, providing a strong un-saturated gradient
+    that discourages sideways drift more aggressively than the exponential
+    tracker in track_lin_vel_xy_yaw_frame_exp.
+    """
+    asset: RigidObject = env.scene[asset_cfg.name]
+    # Body-frame linear velocity: [:, 0]=x, [:, 1]=y, [:, 2]=z
+    vel_y_body = asset.data.root_lin_vel_b[:, 1]
+    # Command: [lin_vel_x, lin_vel_y, ang_vel_z]
+    cmd = env.command_manager.get_command(command_name)
+    vel_y_cmd = cmd[:, 1]
+    return torch.square(vel_y_body - vel_y_cmd)
+
+
+def heading_velocity_alignment(
+    env: ManagerBasedRLEnv,
+    command_name: str = "base_velocity",
+    speed_threshold: float = 0.1,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Reward alignment between the velocity direction and the robot heading.
+
+    Uses the ratio v_x / |v_xy| in the body frame as a proxy for alignment.
+    Returns +1 when perfectly aligned forward, 0 when perpendicular, -1 when
+    walking backward.  Only active when the robot is actually moving
+    (|v_xy| > speed_threshold) and a non-zero command is given.
+    """
+    asset: RigidObject = env.scene[asset_cfg.name]
+    vel_xy = asset.data.root_lin_vel_b[:, :2]
+    speed = torch.linalg.norm(vel_xy, dim=1)
+    # Alignment: v_x / |v|, clamped to [-1, 1]
+    alignment = vel_xy[:, 0] / (speed + 1e-6)
+    alignment = torch.clamp(alignment, -1.0, 1.0)
+
+    # Only reward when actually moving
+    moving_mask = (speed > speed_threshold).float()
+    # Only reward when a command is given
+    cmd_norm = torch.linalg.norm(env.command_manager.get_command(command_name), dim=1)
+    cmd_mask = (cmd_norm > 0.05).float()
+
+    return alignment * moving_mask * cmd_mask
+
+
+def base_yaw_rate_penalty(
+    env: ManagerBasedRLEnv,
+    command_name: str = "base_velocity",
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalise yaw angular velocity error from the commanded yaw rate.
+
+    Computes (omega_z - omega_z_cmd)^2.  Prevents the robot from slowly
+    rotating its heading, which manifests as diagonal walking when
+    combined with forward velocity.
+    """
+    asset: RigidObject = env.scene[asset_cfg.name]
+    # Body-frame angular velocity: [:, 2] = yaw rate
+    yaw_rate = asset.data.root_ang_vel_b[:, 2]
+    # Command: [lin_vel_x, lin_vel_y, ang_vel_z]
+    cmd = env.command_manager.get_command(command_name)
+    yaw_rate_cmd = cmd[:, 2]
+    return torch.square(yaw_rate - yaw_rate_cmd)
