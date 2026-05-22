@@ -44,9 +44,9 @@ class RobotSceneCfg(InteractiveSceneCfg):
     # ground terrain
     terrain = TerrainImporterCfg(
         prim_path="/World/ground",
-        terrain_type="generator",  # "plane", "generator"
-        terrain_generator=COBBLESTONE_ROAD_CFG,  # None, ROUGH_TERRAINS_CFG
-        max_init_terrain_level=COBBLESTONE_ROAD_CFG.num_rows - 1,
+        terrain_type="plane",  # "plane", "generator"
+        terrain_generator=None,  # None, ROUGH_TERRAINS_CFG
+        max_init_terrain_level=0,
         collision_group=-1,
         physics_material=sim_utils.RigidBodyMaterialCfg(
             friction_combine_mode="multiply",
@@ -429,12 +429,12 @@ class RewardsCfg:
     # )
     joint_deviation_legs = RewTerm(
         func=mdp.joint_deviation_l1,
-        weight=-1.0,
+        weight=-2.0,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_hip_roll_joint", ".*_hip_yaw_joint"])},
     )
     joint_mirror = RewTerm(
         func=mdp.joint_mirror,
-        weight=-0.4,
+        weight=-0.5,
         params={
             "asset_cfg": SceneEntityCfg("robot"),
             "mirror_joints": [
@@ -502,7 +502,7 @@ class RewardsCfg:
 
     periodic_gait = RewTerm(
         func=mdp.periodic_bipedal_gait_reward,
-        weight=0.5,
+        weight=1.5,
         params={
             "period": 0.6,
             "offset": [0.0, 0.5],
@@ -561,7 +561,6 @@ class TerminationsCfg:
 class CurriculumCfg:
     """Curriculum terms for the MDP."""
 
-    terrain_levels = CurrTerm(func=mdp.terrain_levels_vel)
     lin_vel_cmd_levels = CurrTerm(mdp.lin_vel_cmd_levels)
     ang_vel_cmd_levels = CurrTerm(mdp.ang_vel_cmd_levels)
 
